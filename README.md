@@ -1,96 +1,109 @@
-# SmartFlow — AI Traffic Management System
+# SmartFlow - Nagpur AI Traffic Management
 
-## Quick Start (VS Code)
-
-```bash
-# 1. Open folder in VS Code
-code smartflow/
-
-# 2. Create virtual environment (VS Code will detect it)
-python -m venv .venv
-source .venv/bin/activate        # Mac/Linux
-# .venv\Scripts\activate         # Windows
-
-# 3. Install dependencies
-pip install numpy pandas scikit-learn
-
-# 4. Run tests (VS Code Testing panel or terminal)
-python tests/test_all.py
-
-# 5. Start the server
-python backend/server.py
-
-# 6. Open dashboard
-# http://localhost:8000
-```
+SmartFlow is a Python traffic simulation and operations dashboard for 20 Nagpur intersections. This version upgrades the existing project in place; it keeps the Q-learning signal controller and simulator while making the map controls, weather, congestion prediction, accidents, pedestrians, emergency priority, analytics, and emissions work from shared backend state.
 
 ## Architecture
 
+```text
+Browser dashboard (Leaflet + OpenStreetMap)
+    |-- Server-Sent Events: live intersection and analytics state
+    |-- JSON API: weather, traffic, accidents, emergency, AI mode
+    v
+ThreadingHTTPServer (backend/server.py)
+    |-- TrafficGenerator: vehicles, weather, pedestrians, incidents, emissions
+    |-- TrafficManagementSystem: per-intersection Q-learning controllers
+    |-- CongestionPredictor: Random Forest or dependency-free heuristic
+    v
+Kaggle CSV / synthetic training data + saved Q-table checkpoints
 ```
-smartflow/
-├── backend/
-│   └── server.py          # HTTP server + SSE + all API endpoints
-├── ml/
-│   ├── signal_controller.py   # Q-learning RL agent per intersection
-│   └── congestion_predictor.py # RandomForest 5-tick ahead prediction
-├── simulator/
-│   └── traffic_generator.py   # Synthetic traffic (rush hour, incidents, emergencies)
-├── tests/
-│   └── test_all.py            # Full test suite (25 tests)
-└── README.md
+
+## Features
+
+- Nagpur OpenStreetMap with 20 named intersections
+- Animated vehicles that respond to signal phases and accidents
+- Adaptive signals, live countdowns, pedestrian crossing phases
+- Congestion prediction and predictive heatmap
+- Ambulance routing with a low-congestion green wave
+- Persistent backend accident and emergency simulation
+- Clear, rain, fog, and storm effects with humidity and temperature
+- AI vs fixed-time comparison and wait-time history
+- GPS nearest-signal lookup
+- Live fuel-idling and CO2 estimates
+- Threaded Python API so SSE and dashboard controls work together
+- SmartFlow Mobility OS hybrid UI with a compact proportional map
+- Animated navigation, cards, counters, traffic twin, alerts, and transitions
+- Explainable AI decisions and a live city mobility health score
+- 5, 15, and 30 minute congestion forecast panel
+- What-if traffic and weather scenario modeling
+- Pause, replay, and scrub controls for recent traffic states
+- Fastest, low-emission, and low-congestion route comparison
+- Multi-signal green-wave corridor builder
+- Prioritized alert drawer and operations decision log
+
+## Run
+
+```powershell
+cd "smartflow_v2\smartflow"
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+python backend\server.py
 ```
 
-## Components
+Open `http://localhost:8000`.
 
-### Synthetic Traffic Generator
-- Rush hour curves (8am + 6pm peaks)
-- Poisson vehicle arrivals per lane
-- Random incidents (2% per tick) and emergencies (1% per tick)
-- Weather multiplier effects
-- Configurable tick speed (default: 30s per tick)
+To run another SmartFlow instance on a different port:
 
-### RL Signal Controller (Q-Learning)
-- State: queue bucket + wait time bucket + time of day + phase
-- Actions: 7 phase durations (10, 20, 30, 45, 60, 90, 120 seconds)
-- Reward: −(total_queue × 2 + avg_wait)
-- Emergency override: always 10s phase to cycle quickly
-- Incident override: 90s green for congested direction
-- Epsilon-greedy with decay (0.30 → 0.05)
+```powershell
+$env:SMARTFLOW_PORT="8011"
+python backend\server.py
+```
 
-### Congestion Predictor
-- RandomForestRegressor (100 trees)
-- Predicts total queue 5 ticks ahead (~2.5 minutes)
-- Features: queue, wait, time-of-day (sin/cos encoded), weather, lane breakdown
-- Trains in background on startup (~30s)
-- Output: predicted_queue + congestion_level (low/medium/high)
+The dashboard can also run without installing ML dependencies. In that case SmartFlow automatically uses the built-in congestion heuristic.
 
-### API Server (pure Python stdlib)
-- `GET  /`                    — Live dashboard (HTML)
-- `GET  /api/status`          — All intersection states (JSON)
-- `GET  /api/stats`           — RL agent stats
-- `GET  /api/predict/<id>`    — Congestion prediction
-- `GET  /api/history`         — Wait time history array
-- `POST /api/train`           — Retrain predictor
-- `POST /api/phase/<id>`      — Override phase duration
-- `GET  /stream`              — SSE live stream (used by dashboard)
+## Kaggle Training
 
-### Dashboard
-- Built-in, served at `/`
-- Live intersection cards (queue, wait, phase, emergency badge)
-- Congestion prediction per intersection
-- Wait time history chart
-- System-wide metrics bar
+The trainer supports the Kaggle **Traffic Prediction Dataset** schema (`DateTime`, `Junction`, `Vehicles`) and Metro Interstate-style traffic CSV columns.
 
-## VS Code Tips
-- Install **Python** + **Pylance** extensions
-- Set interpreter to `.venv/python`
-- Run/debug `backend/server.py` via Run menu (F5)
-- Use **REST Client** extension to test API endpoints
-- `tests/test_all.py` shows in the Testing panel automatically
+1. Install and authenticate the Kaggle CLI.
+2. Download and extract the dataset:
 
-## Training Notes
-Predictor trains automatically on startup (~800 synthetic ticks, ~30s).
-To retrain manually: `POST http://localhost:8000/api/train`
+```powershell
+kaggle datasets download -d fedesoriano/traffic-prediction-dataset -p data --unzip
+```
 
-RL agents train online — improve continuously as simulator runs.
-Save checkpoints: agents call `tms.save_all("checkpoints/")` on shutdown (Ctrl+C).
+3. Train and save the model:
+
+```powershell
+python train_model.py --csv data\traffic.csv --output models\congestion.pkl
+```
+
+4. Start SmartFlow using that CSV for startup training:
+
+```powershell
+$env:SMARTFLOW_DATASET="data\traffic.csv"
+python backend\server.py
+```
+
+You can also call `POST /api/train` with JSON `{"dataset_path":"data/traffic.csv"}`.
+
+## API
+
+- `GET /api/status` - all live intersection states
+- `GET /api/analytics` - queue, wait, weather, fuel, CO2, pedestrians
+- `GET /api/comparison` - AI vs traditional signal results
+- `GET /api/predict/<id>` - congestion forecast
+- `POST /api/weather` - `{"condition":"rain"}`
+- `POST /api/emergency` - `{"intersection_id":"INT_01"}`
+- `POST /api/accident` - `{"intersection_id":"INT_01","active":true}`
+- `POST /api/add_traffic` - add a traffic spike
+- `POST /api/ai_mode` - switch adaptive/fixed signal control
+- `GET /stream` - live SSE feed
+
+## Tests
+
+```powershell
+python -m unittest tests.test_all -v
+```
+
+The suite covers traffic generation, weather telemetry, accidents, operational metrics, Q-learning, and prediction behavior.

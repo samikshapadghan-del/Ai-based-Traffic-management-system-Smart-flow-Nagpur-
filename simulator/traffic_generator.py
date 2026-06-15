@@ -44,6 +44,9 @@ class IntersectionState:
     phase_duration: float = 30.0
     emergency_active: bool = False
     incident_active: bool = False
+    accident_active: bool = False
+    pedestrian_waiting: int = 0
+    cycles_since_pedestrian: int = 0
     timestamp: float = field(default_factory=time.time)
 
 
@@ -90,8 +93,16 @@ class TrafficGenerator:
         self.time_of_day: float = 8.0  # 24h float, starts at 8am
         self.weather_multiplier: float = 1.0
         self.weather_condition: str = "clear"  # clear/rain/fog/storm
+        self.weather = {
+            "temperature_c": 31.0,
+            "humidity_pct": 42,
+            "precipitation_mm": 0.0,
+            "visibility_km": 10.0,
+        }
         self.ai_mode: bool = True  # AI vs Traditional toggle
         self.emergency_vehicles: List[Dict] = []
+        self._emergency_ticks: Dict[str, int] = {}
+        self._accident_ticks: Dict[str, int] = {}
         self._tick = 0
 
         for i in range(self.num_intersections):
@@ -118,13 +129,14 @@ class TrafficGenerator:
         lam = demand * ew_bias * 8  # avg 8 vehicles/tick at peak
         return max(0, int(random.gauss(lam, math.sqrt(lam) + 0.1)))
 
-    def _update_queue(self, lane: Lane, phase: Phase, arrivals: int):
+    def _update_queue(self, lane: Lane, phase: Phase, arrivals: int, blocked: bool = False):
         """Queue builds when phase is red, drains when green."""
         green_dirs = {"NS_GREEN": ("N", "S"), "EW_GREEN": ("E", "W")}
         active = green_dirs.get(phase.value, ())
         discharge = 0
-        if lane.direction in active:
-            discharge = min(lane.queue + arrivals, random.randint(4, 7))
+        if lane.direction in active and not blocked:
+            capacity = max(1, round(random.randint(4, 7) * self.weather_multiplier))
+            discharge = min(lane.queue + arrivals, capacity)
         lane.queue = max(0, lane.queue + arrivals - discharge)
         lane.wait_time = lane.queue * random.uniform(2.5, 4.0)
         lane.flow_rate = discharge * 2  # vehicles/min approx
@@ -137,9 +149,22 @@ class TrafficGenerator:
 
     def set_weather(self, condition: str):
         """Set weather: clear/rain/fog/storm"""
-        multipliers = {"clear": 1.0, "rain": 0.7, "fog": 0.6, "storm": 0.4}
+        profiles = {
+            "clear": (1.0, 31.0, 42, 0.0, 10.0),
+            "rain": (0.72, 25.0, 84, 5.5, 6.0),
+            "fog": (0.58, 23.0, 91, 0.2, 1.8),
+            "storm": (0.40, 22.0, 96, 18.0, 2.5),
+        }
+        condition = condition if condition in profiles else "clear"
+        multiplier, temperature, humidity, precipitation, visibility = profiles[condition]
         self.weather_condition = condition
-        self.weather_multiplier = multipliers.get(condition, 1.0)
+        self.weather_multiplier = multiplier
+        self.weather = {
+            "temperature_c": temperature,
+            "humidity_pct": humidity,
+            "precipitation_mm": precipitation,
+            "visibility_km": visibility,
+        }
 
     def set_ai_mode(self, enabled: bool):
         self.ai_mode = enabled
@@ -155,6 +180,19 @@ class TrafficGenerator:
         """Force emergency at intersection."""
         if intersection_id in self.intersections:
             self.intersections[intersection_id].emergency_active = True
+            self._emergency_ticks[intersection_id] = 6
+
+    def set_accident(self, intersection_id: str, active: bool = True):
+        """Create or clear a persistent accident in simulation state."""
+        if intersection_id not in self.intersections:
+            return False
+        self.intersections[intersection_id].accident_active = active
+        if active:
+            self._accident_ticks[intersection_id] = 30
+            self.add_traffic_spike(intersection_id, 2.5)
+        else:
+            self._accident_ticks.pop(intersection_id, None)
+        return True
 
     def tick(self, delta_seconds: float = 30.0):
         """Advance simulation by delta_seconds."""
@@ -162,8 +200,7 @@ class TrafficGenerator:
         self.time_of_day = (self.time_of_day + delta_seconds / 3600) % 24
 
         # Random weather event (3% chance per tick) — only if not manually set
-        if random.random() < 0.03 and self.weather_condition == "clear":
-            self.weather_multiplier = random.uniform(0.75, 1.0)
+        # Manual weather remains stable until changed through the API.
 
         # Random incident (2% chance)
         incident_id = random.choice(list(self.intersections.keys()))
@@ -177,21 +214,49 @@ class TrafficGenerator:
             inter.timestamp = time.time()
             inter.phase_elapsed += delta_seconds
             inter.incident_active = (iid == incident_id and incident_active)
-            inter.emergency_active = (iid == incident_id and emergency_active)
+
+            if emergency_active and iid == incident_id:
+                self._emergency_ticks[iid] = 4
+            if self._emergency_ticks.get(iid, 0) > 0:
+                inter.emergency_active = True
+                self._emergency_ticks[iid] -= 1
+            else:
+                inter.emergency_active = False
+                self._emergency_ticks.pop(iid, None)
+
+            if self._accident_ticks.get(iid, 0) > 0:
+                inter.accident_active = True
+                self._accident_ticks[iid] -= 1
+            elif inter.accident_active:
+                inter.accident_active = False
+                self._accident_ticks.pop(iid, None)
+
+            inter.pedestrian_waiting = min(
+                80, inter.pedestrian_waiting + random.randint(0, 3)
+            )
 
             # Advance phase if duration elapsed
             if inter.phase_elapsed >= inter.phase_duration:
                 inter.phase_elapsed = 0.0
-                phases = [Phase.NORTH_SOUTH_GREEN, Phase.EAST_WEST_GREEN]
-                inter.current_phase = phases[(phases.index(inter.current_phase) + 1) % 2] \
-                    if inter.current_phase in phases else Phase.NORTH_SOUTH_GREEN
+                if inter.current_phase == Phase.PEDESTRIAN:
+                    inter.current_phase = Phase.NORTH_SOUTH_GREEN
+                    inter.pedestrian_waiting = max(0, inter.pedestrian_waiting - random.randint(8, 18))
+                    inter.cycles_since_pedestrian = 0
+                elif inter.pedestrian_waiting >= 8 and inter.cycles_since_pedestrian >= 2:
+                    inter.current_phase = Phase.PEDESTRIAN
+                    inter.phase_duration = 15.0
+                else:
+                    phases = [Phase.NORTH_SOUTH_GREEN, Phase.EAST_WEST_GREEN]
+                    inter.current_phase = phases[(phases.index(inter.current_phase) + 1) % 2] \
+                        if inter.current_phase in phases else Phase.NORTH_SOUTH_GREEN
+                    inter.cycles_since_pedestrian += 1
 
             for direction, lane in inter.lanes.items():
                 arrivals = self._generate_arrivals(direction)
                 # Incident doubles queue buildup at that intersection
-                if inter.incident_active:
+                if inter.incident_active or inter.accident_active:
                     arrivals = int(arrivals * 2.5)
-                self._update_queue(lane, inter.current_phase, arrivals)
+                self._update_queue(lane, inter.current_phase, arrivals, inter.accident_active)
 
             states[iid] = self._serialize(inter)
 
@@ -204,9 +269,15 @@ class TrafficGenerator:
 
     def _serialize(self, inter: IntersectionState) -> dict:
         meta = self.intersection_meta.get(inter.id, {})
-        # Traditional mode: fixed 30s phases regardless of RL
-        trad_wait = round(sum(l.wait_time for l in inter.lanes.values()) / 4 * (1.6 if not self.ai_mode else 1.0), 1)
         ai_wait   = round(sum(l.wait_time for l in inter.lanes.values()) / 4, 1)
+        imbalance = abs(
+            (inter.lanes["N"].queue + inter.lanes["S"].queue)
+            - (inter.lanes["E"].queue + inter.lanes["W"].queue)
+        )
+        trad_wait = round(ai_wait * 1.22 + imbalance * 0.9 + 4.0, 1)
+        total_queue = sum(l.queue for l in inter.lanes.values())
+        fuel_litres = total_queue * 0.8 * ai_wait / 3600
+        co2_kg = fuel_litres * 2.31
         return {
             "id": inter.id,
             "name": meta.get("name", inter.id),
@@ -217,10 +288,15 @@ class TrafficGenerator:
             "phase": inter.current_phase.value,
             "phase_elapsed": round(inter.phase_elapsed, 1),
             "phase_duration": round(inter.phase_duration, 1),
+            "countdown": max(0, round(inter.phase_duration - inter.phase_elapsed, 1)),
             "emergency": inter.emergency_active,
             "incident": inter.incident_active,
+            "accident": inter.accident_active,
+            "pedestrian_waiting": inter.pedestrian_waiting,
+            "pedestrian_crossing": inter.current_phase == Phase.PEDESTRIAN,
             "weather_multiplier": round(self.weather_multiplier, 2),
             "weather_condition": self.weather_condition,
+            "weather": self.weather.copy(),
             "ai_mode": self.ai_mode,
             "lanes": {
                 d: {
@@ -231,10 +307,12 @@ class TrafficGenerator:
                 }
                 for d, lane in inter.lanes.items()
             },
-            "total_queue": sum(l.queue for l in inter.lanes.values()),
+            "total_queue": total_queue,
             "avg_wait": round(ai_wait, 1),
             "traditional_wait": round(trad_wait, 1),
             "ai_wait": round(ai_wait, 1),
+            "fuel_litres": round(fuel_litres, 3),
+            "co2_kg": round(co2_kg, 3),
         }
 
 

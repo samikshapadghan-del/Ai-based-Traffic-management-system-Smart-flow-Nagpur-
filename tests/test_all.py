@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from simulator.traffic_generator import TrafficGenerator, Phase
 from ml.signal_controller import SignalController, TrafficManagementSystem
 from ml.congestion_predictor import CongestionPredictor
+from backend.server import DASHBOARD_HTML
 
 
 class TestTrafficGenerator(unittest.TestCase):
@@ -55,6 +56,26 @@ class TestTrafficGenerator(unittest.TestCase):
         states = self.gen.tick()
         for s in states.values():
             self.assertIsInstance(s["emergency"], bool)
+
+    def test_weather_telemetry_changes(self):
+        self.gen.set_weather("rain")
+        state = next(iter(self.gen.tick().values()))
+        self.assertEqual(state["weather_condition"], "rain")
+        self.assertGreater(state["weather"]["humidity_pct"], 80)
+        self.assertGreater(state["weather"]["precipitation_mm"], 0)
+
+    def test_accident_persists_and_can_clear(self):
+        iid = next(iter(self.gen.intersections))
+        self.assertTrue(self.gen.set_accident(iid, True))
+        self.assertTrue(self.gen.tick()[iid]["accident"])
+        self.gen.set_accident(iid, False)
+        self.assertFalse(self.gen.tick()[iid]["accident"])
+
+    def test_operational_metrics_are_serialized(self):
+        state = next(iter(self.gen.tick().values()))
+        for key in ["countdown", "pedestrian_waiting", "fuel_litres", "co2_kg"]:
+            self.assertIn(key, state)
+        self.assertGreaterEqual(state["countdown"], 0)
 
 
 class TestSignalController(unittest.TestCase):
@@ -164,6 +185,22 @@ class TestCongestionPredictor(unittest.TestCase):
         self.assertTrue(self.pred.is_trained)
 
 
+class TestDashboard(unittest.TestCase):
+
+    def test_hybrid_ui_feature_contract(self):
+        required = [
+            "buildHybridUI", "AI Signal Cockpit", "AI Forecast",
+            "Operations Log", "Priority Routing", "whatif-result",
+            "alert-drawer", "stateTimeline", "buildGreenWave", "city-score",
+        ]
+        for marker in required:
+            self.assertIn(marker, DASHBOARD_HTML)
+
+    def test_map_is_bounded_in_dashboard(self):
+        self.assertIn(".map-panel{height:430px", DASHBOARD_HTML)
+        self.assertIn("fullscreen-map", DASHBOARD_HTML)
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("SmartFlow Test Suite")
@@ -171,7 +208,8 @@ if __name__ == "__main__":
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
     for cls in [TestTrafficGenerator, TestSignalController,
-                TestTrafficManagementSystem, TestCongestionPredictor]:
+                TestTrafficManagementSystem, TestCongestionPredictor,
+                TestDashboard]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
